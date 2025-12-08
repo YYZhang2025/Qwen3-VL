@@ -1,0 +1,27 @@
+[project]
+name = "qwen-series"
+readme = "ReadME.md"
+version = "0.1.0"
+requires-python = "==3.12.*"
+dependencies = [
+    "datasets>=4.0.0",
+    "dotenv>=0.9.9",
+    "einops>=0.8.1",
+    "huggingface-hub>=0.34.2",
+    "numpy<3",
+    "pillow>=11.3.0",
+    "torch==2.8.0",
+    "torchvision>=0.22.1",
+    "transformers>=4.54.0",
+    "wandb>=0.21.0",
+    "rich>=13.3.4",
+]
+
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+fix = true
