@@ -16,6 +16,7 @@ dependencies = [
     "wandb>=0.21.0",
     "rich>=13.3.4",
     "matplotlib>=3.10.7",
+    "accelerate>=1.12.0",
 ]
 
 
