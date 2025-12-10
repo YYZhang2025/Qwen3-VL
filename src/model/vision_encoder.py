@@ -209,13 +209,11 @@ class VisionEncoder(nn.Module):
             w_idxs_floor = w_idxs.int()
             h_idxs_ceil = (h_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
             w_idxs_ceil = (w_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
-
             dh = h_idxs - h_idxs_floor
             dw = w_idxs - w_idxs_floor
 
             base_h = h_idxs_floor * self.num_grid_per_side
             base_h_ceil = h_idxs_ceil * self.num_grid_per_side
-
             indices = [
                 (base_h[None].T + w_idxs_floor[None]).flatten(),
                 (base_h[None].T + w_idxs_ceil[None]).flatten(),
@@ -261,6 +259,7 @@ class VisionEncoder(nn.Module):
         for t, h, w in d_image:
             h = int(h.item())
             w = int(w.item())
+            t = int(t.item())
 
             hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
             hpos_ids = hpos_ids.view(h // sms, sms, w // sms, sms).transpose(1, 2)

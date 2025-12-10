@@ -16,7 +16,6 @@ class Qwen3VL(nn.Module):
     def __init__(self, config: Qwen3VLConfig):
         super().__init__()
         self.config = config
-        self.vision_config = config.vision_config
 
         self.lm_model = Qwen3LanguageModel(config.language_config)
         self.lm_head = None
@@ -25,8 +24,8 @@ class Qwen3VL(nn.Module):
                 config.language_config.n_embed, config.language_config.n_vocab, bias=False
             )
 
-        if self.vision_config is not None:
-            self.visual_model = VisionEncoder(self.vision_config)
+        if self.config.vision_config is not None:
+            self.visual_model = VisionEncoder(self.config.vision_config)
 
     def forward(
         self,
@@ -35,17 +34,18 @@ class Qwen3VL(nn.Module):
         d_image: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         input_embeds = self.lm_model.embed_tokens(input_ids)
+
+        # Get position IDs (t, h, w) for each token
         position_ids = self._get_position_ids(input_ids=input_ids, d_image=d_image)
 
         if pixels is not None:
             pixels = pixels.to(input_embeds.dtype)
-            vision_embed, vision_residuals = self.visual_model(pixels=pixels, d_image=d_image)
-            image_pad_token = getattr(self.config, "image_token_id", 151655)
-            vision_mask = input_ids == image_pad_token
+            vision_embed, deepstack_features = self.visual_model(pixels=pixels, d_image=d_image)
+            vision_mask = input_ids == self.config.image_token_id
             output = self.lm_model(
                 input_embed=input_embeds,
                 vision_embed=vision_embed,
-                vision_residuals=vision_residuals,
+                deepstack_features=deepstack_features,
                 vision_mask=vision_mask,
                 position_ids=position_ids,
             )
@@ -61,12 +61,12 @@ class Qwen3VL(nn.Module):
         self, input_ids: torch.Tensor, d_image: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         B, T = input_ids.shape
-        image_pad_token = getattr(self.config, "image_token_id", 151655)
+        image_pad_token = self.config.image_token_id
 
         # text-only case: sequential position IDs repeated 3 times
         if d_image is None:
             position_ids = torch.arange(T, dtype=torch.long, device=input_ids.device)
-            position_ids = position_ids.unsqueeze(0).expand(3, B, -1)
+            position_ids = position_ids[None, None, :].expand(3, B, -1)
             return position_ids
 
         # text + vision case: 3D position IDs
@@ -103,20 +103,23 @@ class Qwen3VL(nn.Module):
         d_image: torch.Tensor,
         spatial_merge_size: int = 2,
     ) -> Tuple[int, int, int]:
-        t_img, h_img, w_img = d_image[image_idx]
+        t_img, h_img, w_img = d_image[image_idx]  # Extract image dimension info at current image_idx
         t_img = int(t_img.item())
-        h_img = int((h_img // spatial_merge_size).item())
-        w_img = int((w_img // spatial_merge_size).item())
+        h_img = int(h_img.item() // spatial_merge_size)
+        w_img = int(w_img.item() // spatial_merge_size)
 
         image_token_count = h_img * w_img
         video_token_count = t_img * image_token_count
-        for offset in range(video_token_count):
-            target_idx = seq_idx + offset
-            remaining = offset % image_token_count
+
+        for offset in range(video_token_count):  # Start from `offset` token id
+            target_idx = seq_idx + offset  # The absolute position in the sequence
+            # frame_idx = offset // image_token_count  # The frame index
+            remaining = offset % image_token_count  # The position within the current frame
             h_pos = remaining // w_img
             w_pos = remaining % w_img
 
             position_ids[:, batch_idx, target_idx] = text_idx
+            # position_ids[0, batch_idx, target_idx] = text_idx  + frame_idx # temporal position
             position_ids[1, batch_idx, target_idx] = text_idx + h_pos
             position_ids[2, batch_idx, target_idx] = text_idx + w_pos
 

@@ -1,43 +1,8 @@
-from typing import Optional
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.config import LanguageConfig, VisionConfig
-from src.model.vision_encoder import VisionEncoder
-
-
-class RotaryEmbedding(nn.Module):
-    def __init__(self, config: LanguageConfig):
-        super().__init__()
-        d = config.d_head
-        t = config.rope_theta
-        r = torch.arange(0, d, 2)
-        self.register_buffer("inv_freq", 1.0 / (t ** (r / d)).float(), persistent=False)
-
-    def apply_interleaved_mrope(self, freqs, mrope_section):
-        """[TTT...HHH...WWW] -> [THWTHWTHW...TT]"""
-        freqs_t = freqs[0]  # start with temporal dimension
-        for dim, offset in enumerate((1, 2), start=1):  # H, W
-            length = mrope_section[dim] * 3
-            idx = slice(offset, length, 3)
-            freqs_t[..., idx] = freqs[dim, ..., idx]
-        return freqs_t
-
-    def forward(self, x, position_ids):
-        inv_freq = self.inv_freq.to(dtype=torch.float32, device=x.device)
-        inv_freq_expanded = inv_freq[None, None, :, None].expand(3, position_ids.shape[1], -1, 1)
-
-        position_ids_expanded = position_ids[:, :, None, :].float()
-
-        freqs = (inv_freq_expanded @ position_ids_expanded).transpose(2, 3)
-        freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)
-
-        emb = torch.cat([freqs, freqs], dim=-1)
-        cos = emb.cos().to(x.dtype)
-        sin = emb.sin().to(x.dtype)
-        return cos, sin
+from src.config import LanguageConfig
 
 
 class RMSNorm(nn.Module):
@@ -52,6 +17,39 @@ class RMSNorm(nn.Module):
         variance = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * x.to(input_dtype)
+
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, config: LanguageConfig):
+        super().__init__()
+        d = config.d_head
+        t = config.rope_theta
+        r = torch.arange(0, d, 2)
+        self.register_buffer("inv_freq", 1.0 / (t ** (r / d)).float(), persistent=False)
+
+        self.mrope_section = [24, 20, 20]
+
+    def apply_interleaved_mrope(self, freqs, mrope_section):
+        freqs_t = freqs[0]  # start with temporal dimension
+        for dim, offset in enumerate((1, 2), start=1):  # H, W
+            length = mrope_section[dim] * 3
+            idx = slice(offset, length, 3)
+            freqs_t[..., idx] = freqs[dim, ..., idx]
+        return freqs_t
+
+    def forward(self, x: torch.Tensor, position_ids: torch.Tensor):
+        inv_freq = self.inv_freq.to(dtype=torch.float32, device=x.device)
+        inv_freq_expanded = inv_freq[None, None, :, None].expand(3, position_ids.shape[1], -1, 1)
+
+        position_ids_expanded = position_ids[:, :, None, :].float()
+
+        freqs = (inv_freq_expanded @ position_ids_expanded).transpose(2, 3)
+        freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)
+
+        emb = torch.cat([freqs, freqs], dim=-1)
+        cos = emb.cos().to(x.dtype)
+        sin = emb.sin().to(x.dtype)
+        return cos, sin
 
 
 def rotate_half(x):
@@ -111,8 +109,9 @@ class SelfAttention(nn.Module):
         return out
 
 
+# ------- MLP Layer Implementation -------
 class DenseMLP(nn.Module):
-    def __init__(self, config: Qwen3VLConfig):
+    def __init__(self, config: LanguageConfig):
         super().__init__()
         self.fc1 = nn.Linear(config.n_embed, config.n_mlp)
         self.fc2 = nn.Linear(config.n_mlp, config.n_embed)
@@ -128,8 +127,12 @@ class DenseMLP(nn.Module):
         return x + residual
 
 
+# ------- End of MLP Layer Implementation -------
+
+
+# ------- MoE Layer Implementation -------
 class MoEExperts(nn.Module):
-    def __init__(self, config: Qwen3VLConfig):
+    def __init__(self, config: LanguageConfig):
         super().__init__()
 
         self.num_experts = config.n_experts
@@ -187,19 +190,28 @@ class MoEMLP(nn.Module):
         return combined
 
 
+# ------- End of MoE Layer Implementation -------
+
+
+# ------- LM Decoder Layer Implementation -------
 class Block(nn.Module):
     def __init__(self, config: LanguageConfig):
         super().__init__()
-        n_embed, eps = config.n_embed, config.rms_norm_eps
-        self.input_layernorm = RMSNorm(n_embed=n_embed, eps=eps)
+
+        self.input_layernorm = RMSNorm(n_embed=config.n_embed, eps=config.rms_norm_eps)
         self.self_attn = SelfAttention(config)
-        self.post_attention_layernorm = RMSNorm(n_embed=n_embed, eps=eps)
+
+        self.post_attention_layernorm = RMSNorm(n_embed=config.n_embed, eps=config.rms_norm_eps)
         self.mlp = MoEMLP(config) if config.n_experts else DenseMLP(config)
 
     def forward(self, x, cos, sin):
         x = x + self.self_attn(self.input_layernorm(x), cos, sin)
         x = x + self.mlp(self.post_attention_layernorm(x))
+
         return x
+
+
+# ------- End of LM Decoder Layer Implementation -------
 
 
 class Qwen3LanguageModel(nn.Module):
@@ -215,7 +227,7 @@ class Qwen3LanguageModel(nn.Module):
         self,
         input_embed,
         vision_embed=None,
-        vision_residuals=None,
+        deepstack_features=None,
         vision_mask=None,
         position_ids=None,
     ):
@@ -225,11 +237,11 @@ class Qwen3LanguageModel(nn.Module):
         cos, sin = self.rotary_emb(input_embed, position_ids)
         for layer_idx, layer in enumerate(self.layers):
             input_embed = layer(input_embed, cos, sin)
-            if vision_residuals and vision_mask is not None:
+            if deepstack_features and vision_mask is not None:
                 # deepstack process
-                vision_residual = vision_residuals.get(layer_idx)
-                if vision_residual is not None:
-                    input_embed[vision_mask] = input_embed[vision_mask] + vision_residual
+                deepstack_feature = deepstack_features.get(layer_idx)
+                if deepstack_feature is not None:
+                    input_embed[vision_mask] = input_embed[vision_mask] + deepstack_feature
 
         input_embed = self.norm(input_embed)
         return input_embed

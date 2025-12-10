@@ -65,9 +65,9 @@ class ImagePreprocessor:
             image_np_resized = np.tile(image_np_resized, (self.temporal_patch_size, 1, 1, 1))
 
         temporal, channels, height, width = image_np_resized.shape
-        grid_t = temporal // self.temporal_patch_size
-        grid_h = resized_height // self.spatial_patch_size
-        grid_w = resized_width // self.spatial_patch_size
+        grid_t = int(temporal // self.temporal_patch_size)
+        grid_h = int(resized_height // self.spatial_patch_size)
+        grid_w = int(resized_width // self.spatial_patch_size)
 
         patches = image_np_resized.reshape(
             grid_t,
