@@ -1,5 +1,4 @@
 import math
-from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -17,7 +16,6 @@ class VisionRotaryEmbedding(nn.Module):
 
     def forward(self, seq_len: int) -> torch.Tensor:
         seq = torch.arange(seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
-
         freqs = torch.outer(seq, self.inv_freq)
 
         return freqs
@@ -90,13 +88,15 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 def apply_rotary_pos_emb_vision(tensor: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
     orig_dtype = tensor.dtype
     tensor = tensor.float()
+
     cos = freqs.cos()
     sin = freqs.sin()
     cos = cos.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
     sin = sin.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
+
     output = (tensor * cos) + (rotate_half(tensor) * sin)
-    output = output.to(orig_dtype)
-    return output
+
+    return output.to(orig_dtype)
 
 
 class VisionAttention(nn.Module):
@@ -111,7 +111,7 @@ class VisionAttention(nn.Module):
     def forward(self, x: torch.Tensor, cu_seqlens, rotary_pos_emb) -> torch.Tensor:
         seq_length = x.shape[0]
         q, k, v = (
-            self.qkv(x).reshape(seq_length, 3, self.n_heads, self.head_dim).permute(1, 2, 0, 3).unbind(0)
+            self.qkv(x).reshape(seq_length, 3, self.n_heads, self.head_dim).permute(1, 0, 2, 3).unbind(0)
         )
 
         q = apply_rotary_pos_emb_vision(q.unsqueeze(0), rotary_pos_emb).squeeze(0)
@@ -191,7 +191,7 @@ class VisionEncoder(nn.Module):
             [PatchMerger(config, use_postshuffle_norm=True) for _ in self.deepstack_visual_indexes]
         )
 
-        def fast_pos_embed_interpolate(self, d_image: torch.Tensor) -> torch.Tensor:
+    def fast_pos_embed_interpolate(self, d_image: torch.Tensor) -> torch.Tensor:
         """Interpolate learned position embeddings to match image dimensions."""
         grid_ts, grid_hs, grid_ws = d_image[:, 0], d_image[:, 1], d_image[:, 2]
         device = d_image.device
@@ -200,6 +200,8 @@ class VisionEncoder(nn.Module):
         weight_list = [[] for _ in range(4)]
 
         for t, h, w in zip(grid_ts, grid_hs, grid_ws):
+            h = int(h.item())
+            w = int(w.item())
             h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h)
             w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w)
 
@@ -233,24 +235,18 @@ class VisionEncoder(nn.Module):
                 weight_list[i].extend(weights[i].tolist())
 
         idx_tensor = torch.tensor(idx_list, dtype=torch.long, device=device)
-        weight_tensor = torch.tensor(
-            weight_list, dtype=self.pos_embed.weight.dtype, device=device
-        )
+        weight_tensor = torch.tensor(weight_list, dtype=self.pos_embed.weight.dtype, device=device)
         pos_embeds = self.pos_embed(idx_tensor).to(device) * weight_tensor[:, :, None]
         patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
 
-        patch_pos_embeds = patch_pos_embeds.split(
-            [h * w for h, w in zip(grid_hs, grid_ws)]
-        )
+        patch_pos_embeds = patch_pos_embeds.split([h * w for h, w in zip(grid_hs, grid_ws)])
 
         patch_pos_embeds_permute = []
         merge_size = self.config.spatial_merge_size
         for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
             pos_embed = pos_embed.repeat(t, 1)
             pos_embed = (
-                pos_embed.view(
-                    t, h // merge_size, merge_size, w // merge_size, merge_size, -1
-                )
+                pos_embed.view(t, h // merge_size, merge_size, w // merge_size, merge_size, -1)
                 .permute(0, 1, 3, 2, 4, 5)
                 .flatten(0, 4)
             )
@@ -263,6 +259,9 @@ class VisionEncoder(nn.Module):
         sms = self.spatial_merge_size
 
         for t, h, w in d_image:
+            h = int(h.item())
+            w = int(w.item())
+
             hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
             hpos_ids = hpos_ids.view(h // sms, sms, w // sms, sms).transpose(1, 2)
             hpos_ids = hpos_ids.flatten()
@@ -279,28 +278,25 @@ class VisionEncoder(nn.Module):
         rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
         return rotary_pos_emb
-    
-    def forward(self, pixels: torch.Tensor, d_image: torch.Tensor):
+
+    def forward(
+        self, pixels: torch.Tensor, d_image: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
         hidden_states = self.patch_embed(pixels)
-        
+
         pos_embeds = self.fast_pos_embed_interpolate(d_image)
         hidden_states = hidden_states + pos_embeds
-        
+
         rotary_pos_emb = self.rot_pos_emb(d_image)
-        cu_seqlens = torch.repeat_interleave(
-            d_image[:1] * d_image[:, 2], d_image[: 0]
-        ).cumsum(dim = 0, dtype=torch.int32)
-        
-        
+        cu_seqlens = torch.repeat_interleave(d_image[:, 1] * d_image[:, 2], d_image[:, 0]).cumsum(
+            dim=0, dtype=torch.int32
+        )
+
         deepstack_features: dict[int, torch.Tensor] = {}
         for layer_num, blk in enumerate(self.blocks):
-            hidden_states = blk(
-                hidden_states, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb
-            )
+            hidden_states = blk(hidden_states, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb)
             if layer_num in self.deepstack_visual_indexes:
                 ds_idx = self.deepstack_visual_indexes.index(layer_num)
-                deepstack_features[layer_num] = self.deepstack_merger_list[ds_idx](
-                    hidden_states
-                )
+                deepstack_features[layer_num] = self.deepstack_merger_list[ds_idx](hidden_states)
 
         return self.merger(hidden_states), deepstack_features
