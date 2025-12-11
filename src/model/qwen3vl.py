@@ -12,20 +12,35 @@ from src.model.language_decoder import Qwen3LanguageModel
 from src.model.vision_encoder import VisionEncoder
 
 
+class Qwen3VLModel(nn.Module):
+    def __init__(self, config: Qwen3VLConfig):
+        super().__init__()
+
+        self.config = config
+
+        self.language_model = Qwen3LanguageModel(self.config.language_config)
+
+        if self.config.vision_config is not None:
+            self.visual = VisionEncoder(self.config.vision_config)
+
+    def forward(self):
+        pass
+
+
 class Qwen3VL(nn.Module):
     def __init__(self, config: Qwen3VLConfig):
         super().__init__()
         self.config = config
+        self.model = Qwen3VLModel(config)
 
-        self.lm_model = Qwen3LanguageModel(config.language_config)
         self.lm_head = None
         if not config.language_config.tie_word_embeddings:
             self.lm_head = nn.Linear(
                 config.language_config.n_embed, config.language_config.n_vocab, bias=False
             )
 
-        if self.config.vision_config is not None:
-            self.visual_model = VisionEncoder(self.config.vision_config)
+    def get_input_embeddings(self):
+        return self.model.language_model.embed_tokens
 
     def forward(
         self,
@@ -33,16 +48,16 @@ class Qwen3VL(nn.Module):
         pixels: Optional[torch.Tensor] = None,
         d_image: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        input_embeds = self.lm_model.embed_tokens(input_ids)
+        input_embeds = self.get_input_embeddings()(input_ids)
 
         # Get position IDs (t, h, w) for each token
         position_ids = self._get_position_ids(input_ids=input_ids, d_image=d_image)
 
         if pixels is not None:
             pixels = pixels.to(input_embeds.dtype)
-            vision_embed, deepstack_features = self.visual_model(pixels=pixels, d_image=d_image)
+            vision_embed, deepstack_features = self.model.visual(pixels=pixels, d_image=d_image)
             vision_mask = input_ids == self.config.image_token_id
-            output = self.lm_model(
+            output = self.model.language_model(
                 input_embed=input_embeds,
                 vision_embed=vision_embed,
                 deepstack_features=deepstack_features,
@@ -50,10 +65,12 @@ class Qwen3VL(nn.Module):
                 position_ids=position_ids,
             )
         else:
-            output = self.lm_model(input_embed=input_embeds, position_ids=position_ids)
+            output = self.model.language_model(input_embed=input_embeds, position_ids=position_ids)
 
         logits = (
-            output @ self.lm_model.embed_tokens.weight.T if self.lm_head is None else self.lm_head(output)
+            output @ self.model.language_model.embed_tokens.weight.T
+            if self.lm_head is None
+            else self.lm_head(output)
         )
         return logits
 
@@ -126,7 +143,7 @@ class Qwen3VL(nn.Module):
         return text_idx + 1, image_idx + 1, seq_idx + video_token_count
 
     @classmethod
-    def from_pretrained(cls, weights_path: str, device_map: str = "auto"):
+    def from_pretrained(cls, weights_path: str, device_map: str = "auto") -> torch.nn.Module:
         model_path = Path(weights_path)
 
         with open(model_path / "config.json", "r") as f:
@@ -178,6 +195,7 @@ class Qwen3VL(nn.Module):
 
         return model
 
+    @torch.no_grad()
     def _generate_core(
         self,
         input_ids: torch.Tensor,
@@ -212,8 +230,8 @@ class Qwen3VL(nn.Module):
         input_ids: torch.Tensor,
         pixels: Optional[torch.Tensor] = None,
         d_image: Optional[torch.Tensor] = None,
-        max_new_tokens: int = 1,
-        stop_tokens: list = None,
+        max_new_tokens: int = 100,
+        stop_tokens: Optional[list] = None,
     ):
         generated_ids = input_ids
 
@@ -234,7 +252,7 @@ class Qwen3VL(nn.Module):
         pixels: Optional[torch.Tensor] = None,
         d_image: Optional[torch.Tensor] = None,
         max_new_tokens: int = 1,
-        stop_tokens: list = None,
+        stop_tokens: Optional[list] = None,
     ):
         for token_id, _ in self._generate_core(
             input_ids=input_ids,

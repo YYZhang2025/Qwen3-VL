@@ -49,7 +49,7 @@ class LanguageConfig:
     n_vocab: int = 151936
     tie_word_embeddings: bool = False
 
-    rope_theta: float = 10000.0
+    rope_theta: float = 5000000.0
     rms_norm_eps: float = 1e-6
 
     # MoE parameters

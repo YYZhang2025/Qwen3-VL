@@ -70,12 +70,14 @@ class PatchMerger(nn.Module):
         self.linear_fc2 = nn.Linear(self.hidden_size, config.n_output_embed)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.norm(x.view(-1, self.hidden_size) if self.use_postshuffle_norm else x)
-
-        x = x.view(-1, self.hidden_size)
+        if self.use_postshuffle_norm:
+            x = x.view(-1, self.hidden_size)
+            x = self.norm(x)
+        else:
+            x = self.norm(x)
+            x = x.view(-1, self.hidden_size)
 
         x = self.linear_fc2(self.act_fn(self.linear_fc1(x)))
-
         return x
 
 
@@ -106,7 +108,7 @@ class VisionAttention(nn.Module):
         self.n_heads = config.n_heads
         self.head_dim = config.n_embed // config.n_heads
         self.qkv = nn.Linear(config.n_embed, config.n_embed * 3, bias=True)
-        self.out_proj = nn.Linear(config.n_embed, config.n_embed, bias=True)
+        self.proj = nn.Linear(config.n_embed, config.n_embed, bias=True)
 
     def forward(self, x: torch.Tensor, cu_seqlens, rotary_pos_emb) -> torch.Tensor:
         seq_length = x.shape[0]
@@ -128,13 +130,14 @@ class VisionAttention(nn.Module):
             ] = 0
 
         q, k, v = q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+        attn_weights = torch.matmul(q, k.transpose(1, 2)) / math.sqrt(self.head_dim)
         attn_weights = attn_weights + attention_mask
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
         attn_output = torch.matmul(attn_weights, v)
 
         attn_output = attn_output.transpose(0, 1).reshape(seq_length, -1)
-        attn_output = self.out_proj(attn_output)
+        attn_output = self.proj(attn_output)
         return attn_output
 
 
@@ -164,6 +167,7 @@ class VisionBlock(nn.Module):
     def forward(self, x: torch.Tensor, cu_seqlens, rotary_pos_emb) -> torch.Tensor:
         x = x + self.attn(self.norm1(x), cu_seqlens, rotary_pos_emb)
         x = x + self.mlp(self.norm2(x))
+
         return x
 
 
@@ -278,9 +282,7 @@ class VisionEncoder(nn.Module):
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
         return rotary_pos_emb
 
-    def forward(
-        self, pixels: torch.Tensor, d_image: torch.Tensor
-    ) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
+    def forward(self, pixels: torch.Tensor, d_image: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
         hidden_states = self.patch_embed(pixels)
 
         pos_embeds = self.fast_pos_embed_interpolate(d_image)
@@ -290,12 +292,13 @@ class VisionEncoder(nn.Module):
         cu_seqlens = torch.repeat_interleave(d_image[:, 1] * d_image[:, 2], d_image[:, 0]).cumsum(
             dim=0, dtype=torch.int32
         )
+        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
-        deepstack_features: dict[int, torch.Tensor] = {}
+        deepstack_features: list[torch.Tensor] = []
         for layer_num, blk in enumerate(self.blocks):
             hidden_states = blk(hidden_states, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb)
             if layer_num in self.deepstack_visual_indexes:
                 ds_idx = self.deepstack_visual_indexes.index(layer_num)
-                deepstack_features[layer_num] = self.deepstack_merger_list[ds_idx](hidden_states)
+                deepstack_features.append(self.deepstack_merger_list[ds_idx](hidden_states))
 
         return self.merger(hidden_states), deepstack_features

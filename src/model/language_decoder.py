@@ -113,18 +113,12 @@ class SelfAttention(nn.Module):
 class DenseMLP(nn.Module):
     def __init__(self, config: LanguageConfig):
         super().__init__()
-        self.fc1 = nn.Linear(config.n_embed, config.n_mlp)
-        self.fc2 = nn.Linear(config.n_mlp, config.n_embed)
-        self.activation = nn.GELU()
-        self.norm = RMSNorm(config.n_embed, eps=config.rms_norm_eps)
+        self.gate_proj = nn.Linear(config.n_embed, config.n_mlp, bias=False)
+        self.up_proj = nn.Linear(config.n_embed, config.n_mlp, bias=False)
+        self.down_proj = nn.Linear(config.n_mlp, config.n_embed, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
-        x = self.norm(x)
-        x = self.fc1(x)
-        x = self.activation(x)
-        x = self.fc2(x)
-        return x + residual
+    def forward(self, x):
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 # ------- End of MLP Layer Implementation -------
@@ -237,11 +231,14 @@ class Qwen3LanguageModel(nn.Module):
         cos, sin = self.rotary_emb(input_embed, position_ids)
         for layer_idx, layer in enumerate(self.layers):
             input_embed = layer(input_embed, cos, sin)
-            if deepstack_features and vision_mask is not None:
-                # deepstack process
-                deepstack_feature = deepstack_features.get(layer_idx)
-                if deepstack_feature is not None:
-                    input_embed[vision_mask] = input_embed[vision_mask] + deepstack_feature
+
+            if (
+                deepstack_features is not None
+                and vision_mask is not None
+                and layer_idx < len(deepstack_features)
+            ):
+                deepstack_feature = deepstack_features[layer_idx]
+                input_embed[vision_mask] = input_embed[vision_mask] + deepstack_feature
 
         input_embed = self.norm(input_embed)
         return input_embed

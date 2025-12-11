@@ -21,7 +21,7 @@ from src.config import (
     TOOL_RESPONSE_TEMPLATE,
     USER_MESSAGE_TEMPLATE,
 )
-from src.propcessors.image_processor import ImagePreprocessor
+from src.processors.image_processor import ImagePreprocessor
 from src.utils.vision_utils import fetch_image
 
 
@@ -45,19 +45,8 @@ class Processor:
     def from_pretrained(cls, repo_id: str):
         tokenizer = Tokenizer.from_pretrained(repo_id)
 
-        try:
-            config_file = hf_hub_download(repo_id, "preprocessor_config.json")
-            with open(config_file, "r") as f:
-                config = json.load(f)
-
-            # Extract size parameters
-            size = config.get("size", {})
-            min_pixels = size.get("shortest_edge", 65536)
-            max_pixels = size.get("longest_edge", 16777216)
-        except Exception:
-            # Fallback to defaults if config not found
-            min_pixels = 65536
-            max_pixels = 16777216
+        min_pixels = 65536
+        max_pixels = 16777216
 
         return cls(tokenizer, min_pixels=min_pixels, max_pixels=max_pixels)
 
@@ -86,8 +75,8 @@ class Processor:
             d_image_list.append([grid_t, grid_h, grid_w])
 
             pad_count = (grid_t * grid_h * grid_w) // (
-                self.image_preprocessor.spatial_patch_size * self.image_preprocessor.spatial_patch_size
-            ) - 1
+                self.image_preprocessor.spatial_merge_size * self.image_preprocessor.spatial_merge_size
+            )
             pad_tokens = IMAGE_PAD_TOKEN * pad_count
 
             return IMAGE_TEMPLATE.format(content=pad_tokens)
@@ -95,7 +84,7 @@ class Processor:
             raise ValueError(f"Unsupported content type: {content['type']}")
 
     def __call__(
-        self, messages: List[dict], add_generation_prompt: bool = False, device: Optional[torch.device] = None
+        self, messages: List[dict], add_generation_prompt: bool = True, device: Optional[torch.device] = None
     ):
         pixels_list = []
         d_image_list = []
@@ -142,6 +131,7 @@ class Processor:
             "pixels": pixels,
             "d_image": d_image,
         }
+
         if device is not None:
             output["input_ids"] = output["input_ids"].to(device)
             if output["pixels"] is not None:
