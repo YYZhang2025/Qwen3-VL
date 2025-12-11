@@ -10,3 +10,8 @@ uv sync
 source .venv/bin/activate
 uv pip install -e . 
 ```
+
+
+Here is the example:
+
+<video src="./assets/demo-cli.mp4" controls />
