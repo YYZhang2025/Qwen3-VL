@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -49,6 +51,7 @@ class RotaryEmbedding(nn.Module):
         emb = torch.cat([freqs, freqs], dim=-1)
         cos = emb.cos().to(x.dtype)
         sin = emb.sin().to(x.dtype)
+
         return cos, sin
 
 
@@ -85,7 +88,7 @@ class SelfAttention(nn.Module):
         self.q_norm = RMSNorm(self.d_head, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.d_head, eps=config.rms_norm_eps)
 
-    def forward(self, x: torch.Tensor, cos, sin):
+    def forward(self, x: torch.Tensor, kv_cache: Optional["KVCache"], cos, sin):
         B, T, C = x.shape
 
         q = self.q_proj(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
@@ -98,11 +101,29 @@ class SelfAttention(nn.Module):
 
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        if self.n_kv_heads < self.n_heads:
-            k = k.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1)
-            v = v.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1)
+        # Save query length before cache update
+        T_q = T
 
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True)
+        # KV cache: extend keys/values
+        if kv_cache is not None:
+            k, v = kv_cache.update(self.layer_idx, k, v)  # k: [B, n_kv_heads, T_k, d_head]
+        T_k = k.size(2)
+
+        # Expand KV heads if needed
+        if self.n_kv_heads < self.n_heads:
+            repeat_factor = self.n_heads // self.n_kv_heads
+            k = k.repeat_interleave(repeat_factor, dim=1)
+            v = v.repeat_interleave(repeat_factor, dim=1)
+
+        # Decide causal flag
+        if kv_cache is not None and T_k > T_q:
+            # Incremental decode: query is just last token; allow attending to all keys
+            is_causal = False
+        else:
+            # Full-sequence mode: use causal mask
+            is_causal = True
+
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=is_causal)
         out = out.transpose(1, 2).contiguous().view(B, T, self.n_heads * self.d_head)
         out = self.o_proj(out)
 
@@ -198,10 +219,9 @@ class Block(nn.Module):
         self.post_attention_layernorm = RMSNorm(n_embed=config.n_embed, eps=config.rms_norm_eps)
         self.mlp = MoEMLP(config) if config.n_experts else DenseMLP(config)
 
-    def forward(self, x, cos, sin):
-        x = x + self.self_attn(self.input_layernorm(x), cos, sin)
+    def forward(self, x, kv_cache, cos, sin):
+        x = x + self.self_attn(self.input_layernorm(x), kv_cache, cos, sin)
         x = x + self.mlp(self.post_attention_layernorm(x))
-
         return x
 
 
@@ -222,6 +242,7 @@ class Qwen3LanguageModel(nn.Module):
         input_embed,
         vision_embed=None,
         deepstack_features=None,
+        kv_cache: Optional["KVCache"] = None,
         vision_mask=None,
         position_ids=None,
     ):
@@ -230,7 +251,9 @@ class Qwen3LanguageModel(nn.Module):
 
         cos, sin = self.rotary_emb(input_embed, position_ids)
         for layer_idx, layer in enumerate(self.layers):
-            input_embed = layer(input_embed, cos, sin)
+            # let each attention layer know its index for KV caching
+            layer.self_attn.layer_idx = layer_idx
+            input_embed = layer(input_embed, kv_cache, cos, sin)
 
             if (
                 deepstack_features is not None

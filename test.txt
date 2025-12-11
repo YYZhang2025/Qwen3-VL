@@ -1,0 +1,7 @@
+Who are you?
+
+What in this image /image ./assets/cat.jpg
+
+Give me the content in the image /image https://img.freepik.com/free-vector/realistic-receipt-template_23-2147938550.jpg 
+
+What is the difference between those two image /image ./assets/cat.jpg ./assets/cat_2.jpg
