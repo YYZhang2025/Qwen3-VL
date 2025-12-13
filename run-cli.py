@@ -1,3 +1,4 @@
+import rich
 import torch
 from rich.console import Console
 
@@ -74,7 +75,6 @@ def stream_assistant_reply(model, processor, messages, device, max_new_tokens=25
         print(piece, end="", flush=True)
 
     print()  # newline after streaming
-    print()
 
     # full decoded text for storing in history
     assistant_text = processor.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
@@ -84,12 +84,11 @@ def stream_assistant_reply(model, processor, messages, device, max_new_tokens=25
 def main():
     # 1. Load model & processor
     model = Qwen3VL.from_pretrained("./checkpoints/Qwen3VL-2B-Instruct")
-    print("Model loaded successfully.")
+    rich.print("[bold green]Model loaded successfully.[/bold green]")
 
     processor = Processor.from_pretrained("Qwen/Qwen3-VL-2B-Instruct")
     device = next(model.parameters()).device
-    print("Processor loaded successfully. Device:", device)
-
+    rich.print(f"[bold green]Processor loaded successfully. Device: {device}[/bold green]")
     console = Console()
 
     # 2. Conversation history (list of messages)

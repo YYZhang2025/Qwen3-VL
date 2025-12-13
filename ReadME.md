@@ -14,4 +14,4 @@ uv pip install -e .
 
 Here is the example:
 
-[![CLI demo](./assets/demo-cli.mp4)](./assets/demo-cli.mp4)
+<video src='https://github.com/YYZhang2025/Qwen3-VL/blob/main/assets/demo-cli.mp4' controls='controls' style='max-width: 100%; height: auto;' ></video>

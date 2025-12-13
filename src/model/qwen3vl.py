@@ -291,7 +291,6 @@ class Qwen3VL(nn.Module):
             stop_tokens = [151645, 151644, 151643]
 
         self.eval()
-        self.kv_cache.reset()
         batch_size = input_ids.shape[0]
         assert batch_size == 1, "KV-cache generation currently supports batch_size = 1"
 
@@ -301,8 +300,7 @@ class Qwen3VL(nn.Module):
         generated_ids = input_ids  # [1, T0]
 
         # 1) Build embeddings and 3D position_ids for the prefix
-        embed_tokens = self.get_input_embeddings()
-        input_embeds = embed_tokens(input_ids)  # [1, T0, C]
+        input_embeds = self.get_input_embeddings()(input_ids)  # [1, T0, C]
         position_ids = self._get_position_ids(input_ids=input_ids, d_image=d_image)  # [3, 1, T0]
 
         # 1a) Run the full prefix through the language model once (fills KV cache)
@@ -339,8 +337,8 @@ class Qwen3VL(nn.Module):
             probs = F.softmax(logits, dim=-1)
             return probs.argmax(dim=-1, keepdim=True)  # [1, 1]
 
-            # 2) Main decoding loop: one new token at a time
-
+        # Decoding stage
+        # 2) Main decoding loop: one new token at a time
         for _ in range(max_new_tokens):
             # 2a) Choose next token from previous step's logits
             next_token = sample_next_token(last_logits)  # [1, 1]
@@ -361,7 +359,7 @@ class Qwen3VL(nn.Module):
             new_pos = position_ids_full[:, :, -1:]  # [3, 1, 1]
 
             # 2b) Prepare embedding for the new token only
-            new_embed = embed_tokens(next_token)  # [1, 1, C]
+            new_embed = self.get_input_embeddings()(next_token)  # [1, 1, C]
 
             # 2c) Forward one step through the language model using cached KV
             # No vision_embed / vision_mask here: incremental tokens are text-only.

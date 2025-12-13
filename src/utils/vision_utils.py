@@ -4,6 +4,8 @@ import numpy as np
 import requests
 from PIL import Image
 
+from src.utils.common import ceil_by_factor, floor_by_factor
+
 
 def image_to_numpy(image: Image.Image) -> np.ndarray:
     """
@@ -34,22 +36,6 @@ def fetch_image(url: str) -> Image.Image:
         return Image.open(url)
 
 
-def compute_new_bar_ceil(size: int, factor: int) -> int:
-    """
-    Compute the new size (bar) that is the smallest multiple of factor
-    greater than or equal to size.
-    """
-    return int(np.ceil(size / factor) * factor)
-
-
-def compute_new_bar_floor(size: int, factor: int) -> int:
-    """
-    Compute the new size (bar) that is the largest multiple of factor
-    less than or equal to size.
-    """
-    return int(np.floor(size / factor) * factor)
-
-
 def normalize_image(
     image: np.ndarray,
     mean: np.ndarray,
@@ -78,18 +64,18 @@ def resize_image(
     spatial_factor = spatial_patch_size * spatial_merge_size
 
     # Calculate new height and width, ensuring they are multiples of the patch sizes
-    h_bar = compute_new_bar_ceil(height, spatial_factor)
-    w_bar = compute_new_bar_ceil(width, spatial_factor)
+    h_bar = ceil_by_factor(height, spatial_factor)
+    w_bar = ceil_by_factor(width, spatial_factor)
 
     total_pixels = h_bar * w_bar
     if total_pixels > max_pixels:
         beta = np.sqrt((height * width) / max_pixels)
-        h_bar = max(spatial_factor, compute_new_bar_floor(int(height / beta), spatial_factor))
-        w_bar = max(spatial_factor, compute_new_bar_floor(int(width / beta), spatial_factor))
+        h_bar = max(spatial_factor, floor_by_factor(int(height / beta), spatial_factor))
+        w_bar = max(spatial_factor, floor_by_factor(int(width / beta), spatial_factor))
     elif h_bar * w_bar < min_pixels:
         beta = np.sqrt(min_pixels / (height * width))
-        h_bar = compute_new_bar_ceil(int(height * beta), spatial_factor)
-        w_bar = compute_new_bar_ceil(int(width * beta), spatial_factor)
+        h_bar = ceil_by_factor(int(height * beta), spatial_factor)
+        w_bar = ceil_by_factor(int(width * beta), spatial_factor)
 
     image_resized = numpy_to_image(image).resize((w_bar, h_bar), resample=Image.Resampling.BICUBIC)
 
