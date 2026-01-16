@@ -15,9 +15,11 @@ class RMSNorm(nn.Module):
 
     def forward(self, x):
         input_dtype = x.dtype
+
         x = x.to(torch.float32)
         variance = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.variance_epsilon)
+
         return self.weight * x.to(input_dtype)
 
 
@@ -124,6 +126,7 @@ class SelfAttention(nn.Module):
             is_causal = True
 
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=is_causal)
+
         out = out.transpose(1, 2).contiguous().view(B, T, self.n_heads * self.d_head)
         out = self.o_proj(out)
 

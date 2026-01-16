@@ -43,6 +43,18 @@ class ImagePreprocessor:
         self,
         image: Image.Image,
     ) -> Tuple[np.ndarray, int, int, int]:
+        """
+        Preprocess the input image and convert it into patches.
+        1. Resize the image to fit within the specified pixel range while maintaining aspect ratio.
+        2. Normalize the image using the provided mean and standard deviation.
+        3. Repeat the image along the temporal dimension to create a sequence of frames.
+        4. Divide the image into patches based on the specified temporal and spatial patch sizes.
+        Return:
+            Patches: (Num_Patches, Patch_Size) = (grid_t * grid_h * grid_w, channels * temporal_patch_size * spatial_patch_size * spatial_patch_size)
+            grid_t: Number of patches along the temporal dimension. = 1
+            grid_h: Number of patches along the height. = height // spatial_patch_size
+            grid_w: Number of patches along the width. = width // spatial_patch_size
+        """
         image_np = image_to_numpy(image)
 
         # ----- Resize Image
@@ -60,9 +72,10 @@ class ImagePreprocessor:
 
         # Add Temporal Dimension
         image_np_resized = np.transpose(image_np_resized, (2, 0, 1))
-        image_np_resized = image_np_resized[np.newaxis, ...]
-        if image_np_resized.shape[0] == 1:
-            image_np_resized = np.tile(image_np_resized, (self.temporal_patch_size, 1, 1, 1))
+        image_np_resized = image_np_resized[np.newaxis, ...]  # add temporal dim
+        image_np_resized = np.tile(
+            image_np_resized, (self.temporal_patch_size, 1, 1, 1)
+        )  # tile along temporal dim
 
         temporal, channels, height, width = image_np_resized.shape
         grid_t = int(temporal // self.temporal_patch_size)

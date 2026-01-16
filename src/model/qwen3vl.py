@@ -79,22 +79,28 @@ class Qwen3VL(nn.Module):
     def get_input_embeddings(self):
         return self.model.language_model.embed_tokens
 
+    def get_vision_embeddings(self):
+        pass
+
     def forward(
         self,
         input_ids: torch.Tensor,
-        pixels: Optional[torch.Tensor] = None,
-        d_image: Optional[torch.Tensor] = None,
+        pixels: Optional[torch.Tensor] = None,  # Images
+        d_image: Optional[torch.Tensor] = None,  # Image dimension info: (t, h, w)
         kv_cache: Optional["KVCache"] = None,
     ) -> torch.Tensor:
         input_embeds = self.get_input_embeddings()(input_ids)
 
         # Get position IDs (t, h, w) for each token
-        position_ids = self._get_position_ids(input_ids=input_ids, d_image=d_image)
+        position_ids = Qwen3VL.get_position_ids(
+            input_ids=input_ids, d_image=d_image, image_token_id=self.config.image_token_id
+        )
 
         if pixels is not None:
             pixels = pixels.to(input_embeds.dtype)
             vision_embed, deepstack_features = self.model.visual(pixels=pixels, d_image=d_image)
             vision_mask = input_ids == self.config.image_token_id
+            vision_mask = vision_mask | (input_ids == self.config.video_token_id)
             output = self.model.language_model(
                 input_embed=input_embeds,
                 vision_embed=vision_embed,
@@ -117,34 +123,42 @@ class Qwen3VL(nn.Module):
         )
         return logits
 
-    def _get_position_ids(
-        self, input_ids: torch.Tensor, d_image: Optional[torch.Tensor] = None
+    @staticmethod
+    def get_position_ids(
+        input_ids: torch.Tensor, d_image: Optional[torch.Tensor] = None, image_token_id: int = 151655
     ) -> torch.Tensor:
         B, T = input_ids.shape
-        image_pad_token = self.config.image_token_id
+        image_pad_token = image_token_id
 
         # text-only case: sequential position IDs repeated 3 times
         if d_image is None:
             position_ids = torch.arange(T, dtype=torch.long, device=input_ids.device)
             position_ids = position_ids[None, None, :].expand(3, B, -1)
             return position_ids
+        if d_image.dim() == 2:
+            d_image_batched = [d_image] * B
+        else:
+            d_image_batched = [d_image[b] for b in range(B)]
 
         # text + vision case: 3D position IDs
         position_ids = torch.zeros(3, B, T, dtype=torch.long, device=input_ids.device)
         for batch_idx in range(B):
             seq = input_ids[batch_idx]
+            d_img = d_image_batched[batch_idx]
+            # d_img = d_image[0]
             text_idx, image_idx, seq_idx = 0, 0, 0
+            print("d_img:", d_img)
             while seq_idx < T:
                 token_id = seq[seq_idx].item()
                 if token_id == image_pad_token:
                     # start of an vision block (image(s))
-                    text_idx, image_idx, seq_idx = self._emit_image_block(
+                    text_idx, image_idx, seq_idx = Qwen3VL.emit_image_block(
                         position_ids=position_ids,
                         batch_idx=batch_idx,
                         seq_idx=seq_idx,
                         text_idx=text_idx,
                         image_idx=image_idx,
-                        d_image=d_image,
+                        d_image=d_img,
                     )
                 else:
                     # treat as regular text token
@@ -153,8 +167,8 @@ class Qwen3VL(nn.Module):
 
         return position_ids
 
-    def _emit_image_block(
-        self,
+    @staticmethod
+    def emit_image_block(
         position_ids: torch.Tensor,
         batch_idx: int,
         seq_idx: int,
@@ -164,6 +178,7 @@ class Qwen3VL(nn.Module):
         spatial_merge_size: int = 2,
     ) -> Tuple[int, int, int]:
         t_img, h_img, w_img = d_image[image_idx]  # Extract image dimension info at current image_idx
+        # t_img, h_img, w_img = d_image
         t_img = int(t_img.item())
         h_img = int(h_img.item() // spatial_merge_size)
         w_img = int(w_img.item() // spatial_merge_size)
@@ -173,13 +188,13 @@ class Qwen3VL(nn.Module):
 
         for offset in range(video_token_count):  # Start from `offset` token id
             target_idx = seq_idx + offset  # The absolute position in the sequence
-            # frame_idx = offset // image_token_count  # The frame index
+            frame_idx = offset // image_token_count  # The frame index
             remaining = offset % image_token_count  # The position within the current frame
             h_pos = remaining // w_img
             w_pos = remaining % w_img
 
-            position_ids[:, batch_idx, target_idx] = text_idx
-            # position_ids[0, batch_idx, target_idx] = text_idx  + frame_idx # temporal position
+            # position_ids[:, batch_idx, target_idx] = text_idx
+            position_ids[0, batch_idx, target_idx] = text_idx + frame_idx  # temporal position
             position_ids[1, batch_idx, target_idx] = text_idx + h_pos
             position_ids[2, batch_idx, target_idx] = text_idx + w_pos
 
@@ -301,7 +316,9 @@ class Qwen3VL(nn.Module):
 
         # 1) Build embeddings and 3D position_ids for the prefix
         input_embeds = self.get_input_embeddings()(input_ids)  # [1, T0, C]
-        position_ids = self._get_position_ids(input_ids=input_ids, d_image=d_image)  # [3, 1, T0]
+        position_ids = Qwen3VL.get_position_ids(
+            input_ids=input_ids, d_image=d_image, image_token_id=self.config.image_token_id
+        )  # [3, 1, T0]
 
         # 1a) Run the full prefix through the language model once (fills KV cache)
         if pixels is not None:
@@ -352,9 +369,8 @@ class Qwen3VL(nn.Module):
 
             # ---- KEY CHANGE: recompute full position_ids and slice the last one ----
             # This guarantees we use the exact same RoPE positions as the non-KV path.
-            position_ids_full = self._get_position_ids(
-                input_ids=generated_ids,
-                d_image=d_image,
+            position_ids_full = Qwen3VL.get_position_ids(
+                input_ids=generated_ids, d_image=d_image, image_token_id=self.config.image_token_id
             )  # [3, 1, T_total]
             new_pos = position_ids_full[:, :, -1:]  # [3, 1, 1]
 
@@ -412,14 +428,6 @@ class Qwen3VL(nn.Module):
         max_new_tokens: int = 1,
         stop_tokens: Optional[list] = None,
     ):
-        # for token_id, _ in self._generate_core(
-        #     input_ids=input_ids,
-        #     pixels=pixels,
-        #     d_image=d_image,
-        #     max_new_tokens=max_new_tokens,
-        #     stop_tokens=stop_tokens,
-        # ):
-        #     yield token_id
         for token_id, generated_ids in self._generate_core_with_kv(
             input_ids=input_ids,
             pixels=pixels,

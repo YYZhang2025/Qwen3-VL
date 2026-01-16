@@ -8,7 +8,8 @@ ASSISTANT_MESSAGE_TEMPLATE = "<|im_start|>assistant\n{content}{tool_calls}<|im_e
 TOOL_MESSAGE_TEMPLATE = "<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>\n"
 SYSTEM_MESSAGE_TEMPLATE = "<|im_start|>system\n{content}<|im_end|>\n"
 IMAGE_PAD_TOKEN = "<|image_pad|>"
-IMAGE_TEMPLATE = "<|vision_start|>{content}<|vision_end|>"
+VIDEO_PAD_TOKEN = "<|video_pad|>"
+VISION_TEMPLATE = "<|vision_start|>{content}<|vision_end|>"
 TOOL_CALL_TEMPLATE = '<tool_call>\n{{"name": "{name}", "arguments": {arguments}}}\n</tool_call>'
 TOOL_RESPONSE_TEMPLATE = "<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>\n"
 

@@ -1,4 +1,5 @@
 from io import BytesIO
+from typing import Optional
 
 import numpy as np
 import requests
@@ -80,3 +81,32 @@ def resize_image(
     image_resized = numpy_to_image(image).resize((w_bar, h_bar), resample=Image.Resampling.BICUBIC)
 
     return np.array(image_resized, dtype=np.float32)
+
+
+def sample_frames(
+    total_num_frames: int,
+    *,
+    num_frames: Optional[int] = None,
+    fps: Optional[float] = None,
+    video_fps: Optional[float] = None,
+    default_fps: float = 2.0,
+    min_frames: int = 4,
+    max_frames: int = 768,
+) -> np.ndarray:
+    if fps is not None and num_frames is not None:
+        raise ValueError("`num_frames` and `fps` are mutually exclusive, use only one.")
+
+    # Default behavior follows Qwen3-VL
+    fps = fps if fps is not None else default_fps
+
+    if num_frames is None and fps is not None:
+        if video_fps is None:
+            video_fps = 24.0
+        num_frames = int(total_num_frames / video_fps * fps)
+        num_frames = min(max(num_frames, min_frames), max_frames, total_num_frames)
+
+    if num_frames is None:
+        num_frames = min(max(total_num_frames, min_frames), max_frames)
+
+    indices = np.linspace(0, total_num_frames - 1, num_frames)
+    return np.round(indices).astype(np.int64)

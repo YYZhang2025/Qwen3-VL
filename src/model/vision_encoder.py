@@ -118,6 +118,7 @@ class VisionAttention(nn.Module):
 
         q = apply_rotary_pos_emb_vision(q.unsqueeze(0), rotary_pos_emb).squeeze(0)
         k = apply_rotary_pos_emb_vision(k.unsqueeze(0), rotary_pos_emb).squeeze(0)
+        q, k, v = q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
 
         attention_mask = torch.full(
             (1, seq_length, seq_length), torch.finfo(q.dtype).min, device=q.device, dtype=q.dtype
@@ -129,14 +130,11 @@ class VisionAttention(nn.Module):
                 cu_seqlens[i - 1] : cu_seqlens[i],
             ] = 0
 
-        q, k, v = q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+        )
 
-        attn_weights = torch.matmul(q, k.transpose(1, 2)) / math.sqrt(self.head_dim)
-        attn_weights = attn_weights + attention_mask
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
-        attn_output = torch.matmul(attn_weights, v)
-
-        attn_output = attn_output.transpose(0, 1).reshape(seq_length, -1)
+        attn_output = attn_output.transpose(0, 1).contiguous().view(seq_length, -1)
         attn_output = self.proj(attn_output)
         return attn_output
 

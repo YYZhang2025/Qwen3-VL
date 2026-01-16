@@ -5,49 +5,54 @@ from rich.console import Console
 from src.model.qwen3vl import Qwen3VL
 from src.processors.preprocessor import Processor
 
+# -------------------------
+# Utilities
+# -------------------------
 
-def parse_image_paths(raw: str) -> list[str]:
+
+def parse_paths(raw: str) -> list[str]:
     """
-    Parse one or more image paths from a raw string.
-
-    Supports both space- and comma-separated paths, e.g.:
-      "/image img1.jpg img2.png"
-      "img1.jpg, img2.png"
+    Parse one or more paths from a raw string.
+    Supports space- or comma-separated paths.
     """
     raw = raw.strip()
     if not raw:
         return []
-    # allow comma-separated or space-separated
     parts = raw.replace(",", " ").split()
     return [p for p in parts if p]
 
 
-def build_user_message(text: str, image_paths: list[str] | None = None):
+def build_user_message(
+    text: str,
+    image_paths: list[str] | None = None,
+    video_paths: list[str] | None = None,
+):
     """
-    Build a single user message in the same format as your current run.py.
-
-    If one or more image paths are provided, each is added as a vision
-    content block (in order), followed by the text block.
+    Build a user message with multimodal content blocks.
+    Order matters: vision blocks first, then text.
     """
     content: list[dict] = []
 
     if image_paths:
         for path in image_paths:
-            content.append(
-                {
-                    "type": "image",
-                    "url": path,
-                }
-            )
+            content.append({"type": "image", "url": path})
+
+    if video_paths:
+        for path in video_paths:
+            content.append({"type": "video", "video": path})
 
     content.append({"type": "text", "text": text})
     return {"role": "user", "content": content}
 
 
+# -------------------------
+# Streaming generation
+# -------------------------
+
+
 def stream_assistant_reply(model, processor, messages, device, max_new_tokens=256):
     """
-    Given the full message history, call processor with add_generation_prompt=True,
-    stream the assistant reply, and return the final decoded string.
+    Prepare inputs via Processor, stream model output, and return final text.
     """
     inputs = processor(
         messages,
@@ -56,29 +61,27 @@ def stream_assistant_reply(model, processor, messages, device, max_new_tokens=25
     )
 
     generated_token_ids = []
-
     console = Console()
     console.print("[bold magenta]Assistant:[/bold magenta] ", end="")
 
-    # stream tokens
     for token in model.generate_stream(**inputs, max_new_tokens=max_new_tokens):
-        # token is typically a scalar tensor
         if isinstance(token, torch.Tensor):
             token_id = token.item()
         else:
             token_id = int(token)
 
         generated_token_ids.append(token_id)
-
-        # incremental decode (we keep special tokens off the screen)
         piece = processor.tokenizer.decode([token_id], skip_special_tokens=True)
         print(piece, end="", flush=True)
 
-    print()  # newline after streaming
-
-    # full decoded text for storing in history
+    print()
     assistant_text = processor.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
     return assistant_text, generated_token_ids
+
+
+# -------------------------
+# Main CLI
+# -------------------------
 
 
 def main():
@@ -89,9 +92,10 @@ def main():
     processor = Processor.from_pretrained("Qwen/Qwen3-VL-2B-Instruct")
     device = next(model.parameters()).device
     rich.print(f"[bold green]Processor loaded successfully. Device: {device}[/bold green]")
+
     console = Console()
 
-    # 2. Conversation history (list of messages)
+    # 2. Conversation history
     messages: list[dict] = []
 
     print(
@@ -99,11 +103,14 @@ def main():
         "---------------------------------\n"
         "Commands:\n"
         "  /exit                quit\n"
-        "  /image PATH          send a message with an image\n"
+        "  /image PATHS         send image(s)\n"
+        "  /video PATHS         send video(s)\n"
         "\nExamples:\n"
         "  You: Hello!\n"
         "  You: /image ./assets/cat.jpg\n"
-        "  You: What is this? /image ./assets/cat.jpg\n"
+        "  You: /video ./assets/test_video.mp4\n"
+        "  You: What happens here? /video ./assets/test_video.mp4\n"
+        "  You: Compare /image a.jpg /video b.mp4\n"
         "---------------------------------\n"
     )
 
@@ -115,63 +122,73 @@ def main():
             break
 
         image_paths: list[str] = []
+        video_paths: list[str] = []
         text = user_input
 
-        # Two ways to attach image(s):
-        # 1) Pure command:      /image path1 path2 ...     (then we ask for caption)
-        # 2) Inline in a line:  What is this? /image path1 path2 ...
+        # -------------------------
+        # Pure commands
+        # -------------------------
         if user_input.startswith("/image "):
-            # Mode 1: pure command, no text yet
-            raw_paths = user_input[len("/image ") :].strip()
-            image_paths = parse_image_paths(raw_paths)
-
+            image_paths = parse_paths(user_input[len("/image ") :])
             if not image_paths:
-                print("Please provide at least one image path after /image")
+                print("Please provide image paths after /image")
                 continue
+            text = input("Caption / question: ").strip() or "Describe the image."
 
-            # Ask for the text part of the message
-            text = input("Caption / question about the image(s): ").strip()
-            if not text:
-                text = "Describe the image."
-
-        elif "/image " in user_input:
-            # Mode 2: inline command at the end of the sentence
-            text_part, image_part = user_input.split("/image ", 1)
-            text = text_part.strip()
-            image_paths = parse_image_paths(image_part)
-
-            if not image_paths:
-                print("Please provide at least one image path after /image")
+        elif user_input.startswith("/video "):
+            video_paths = parse_paths(user_input[len("/video ") :])
+            if not video_paths:
+                print("Please provide video paths after /video")
                 continue
+            text = input("Caption / question: ").strip() or "Describe the video."
 
-            if not text:
-                text = "Describe the image."
+        # -------------------------
+        # Inline commands
+        # -------------------------
+        else:
+            if "/image " in text:
+                text_part, image_part = text.split("/image ", 1)
+                text = text_part.strip()
+                image_paths = parse_paths(image_part)
 
-        # 3. Add user message to history
-        user_msg = build_user_message(text, image_paths=image_paths if image_paths else None)
+            if "/video " in text:
+                text_part, video_part = text.split("/video ", 1)
+                text = text_part.strip()
+                video_paths = parse_paths(video_part)
+
+            if (image_paths or video_paths) and not text:
+                text = "Describe the content."
+
+        # -------------------------
+        # Build message
+        # -------------------------
+        user_msg = build_user_message(
+            text=text,
+            image_paths=image_paths if image_paths else None,
+            video_paths=video_paths if video_paths else None,
+        )
         messages.append(user_msg)
 
-        # 4. Generate assistant reply (streaming)
+        # -------------------------
+        # Generate reply
+        # -------------------------
         try:
-            assistant_text, generated_ids = stream_assistant_reply(
-                model, processor, messages, device, max_new_tokens=256
+            assistant_text, _ = stream_assistant_reply(
+                model,
+                processor,
+                messages,
+                device,
+                max_new_tokens=256,
             )
         except KeyboardInterrupt:
             print("\n[Generation interrupted]")
-            # You may want to pop the last user message if you treat it as cancelled:
-            # messages.pop()
+            messages.pop()
             continue
 
-        # 5. Add assistant reply back into history so the chat is multi-turn
         messages.append(
             {
                 "role": "assistant",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": assistant_text,
-                    }
-                ],
+                "content": [{"type": "text", "text": assistant_text}],
             }
         )
 
