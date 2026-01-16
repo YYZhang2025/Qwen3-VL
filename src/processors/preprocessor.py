@@ -232,8 +232,6 @@ class Processor:
         d_image_list = []
         messages_str = ""
 
-        print(messages)
-
         for message in messages:
             role = message.get("role", "")
             content = message.get("content", [])

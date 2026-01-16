@@ -35,11 +35,9 @@ class KVCache:
         k_new, v_new: [B, n_kv_heads, T_new, d_head]
         """
         if len(self.key_cache) <= layer_idx:
-            # First time we see this layer: just store the tensors
             self.key_cache.append(k_new)
             self.value_cache.append(v_new)
         else:
-            # Concatenate along the sequence dimension
             self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], k_new], dim=-2)
             self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], v_new], dim=-2)
 
@@ -49,16 +47,14 @@ class KVCache:
 class Qwen3VLModel(nn.Module):
     def __init__(self, config: Qwen3VLConfig):
         super().__init__()
-
         self.config = config
 
         self.language_model = Qwen3LanguageModel(self.config.language_config)
-
         if self.config.vision_config is not None:
             self.visual = VisionEncoder(self.config.vision_config)
 
     def forward(self):
-        pass
+        raise NotImplementedError("Use Qwen3VL.forward() which wires vision+language correctly.")
 
 
 class Qwen3VL(nn.Module):
@@ -67,7 +63,6 @@ class Qwen3VL(nn.Module):
         self.config = config
         self.model = Qwen3VLModel(config)
 
-        # KV cache object to be used for autoregressive decoding (optional)
         self.kv_cache = KVCache()
 
         self.lm_head = None
@@ -80,27 +75,31 @@ class Qwen3VL(nn.Module):
         return self.model.language_model.embed_tokens
 
     def get_vision_embeddings(self):
-        pass
+        # Optional convenience; keep for API symmetry
+        return getattr(self.model, "visual", None)
 
     def forward(
         self,
         input_ids: torch.Tensor,
-        pixels: Optional[torch.Tensor] = None,  # Images
-        d_image: Optional[torch.Tensor] = None,  # Image dimension info: (t, h, w)
+        pixels: Optional[torch.Tensor] = None,  # Images / video frames
+        d_image: Optional[torch.Tensor] = None,  # (t, h, w) or batched
         kv_cache: Optional["KVCache"] = None,
     ) -> torch.Tensor:
         input_embeds = self.get_input_embeddings()(input_ids)
 
-        # Get position IDs (t, h, w) for each token
         position_ids = Qwen3VL.get_position_ids(
-            input_ids=input_ids, d_image=d_image, image_token_id=self.config.image_token_id
+            input_ids=input_ids,
+            d_image=d_image,
+            image_token_id=self.config.image_token_id,
+            video_token_id=getattr(self.config, "video_token_id", None),
         )
 
         if pixels is not None:
             pixels = pixels.to(input_embeds.dtype)
             vision_embed, deepstack_features = self.model.visual(pixels=pixels, d_image=d_image)
-            vision_mask = input_ids == self.config.image_token_id
-            vision_mask = vision_mask | (input_ids == self.config.video_token_id)
+            vision_mask = (input_ids == self.config.image_token_id) | (
+                input_ids == getattr(self.config, "video_token_id", self.config.image_token_id)
+            )
             output = self.model.language_model(
                 input_embed=input_embeds,
                 vision_embed=vision_embed,
@@ -125,33 +124,61 @@ class Qwen3VL(nn.Module):
 
     @staticmethod
     def get_position_ids(
-        input_ids: torch.Tensor, d_image: Optional[torch.Tensor] = None, image_token_id: int = 151655
+        input_ids: torch.Tensor,
+        d_image: Optional[torch.Tensor] = None,
+        image_token_id: int = 151655,
+        video_token_id: Optional[int] = None,
     ) -> torch.Tensor:
+        """
+        Returns position_ids shaped [3, B, T].
+
+        Text-only:
+          position_ids[:, b, t] = t  (repeated in 3 channels)
+
+        Text+vision:
+          - text tokens get 1D position (same value in 3 channels)
+          - vision tokens get 3D (t, h, w)-like positions.
+        """
         B, T = input_ids.shape
         image_pad_token = image_token_id
 
-        # text-only case: sequential position IDs repeated 3 times
         if d_image is None:
             position_ids = torch.arange(T, dtype=torch.long, device=input_ids.device)
-            position_ids = position_ids[None, None, :].expand(3, B, -1)
-            return position_ids
-        if d_image.dim() == 2:
-            d_image_batched = [d_image] * B
-        else:
-            d_image_batched = [d_image[b] for b in range(B)]
+            return position_ids[None, None, :].expand(3, B, -1)
 
-        # text + vision case: 3D position IDs
+        # Support both:
+        # - d_image: [3]  (shared)
+        # - d_image: [B, 3]
+        # - d_image: [N_img, 3] with B==1 use first (common in pipelines)
+        if d_image.dim() == 1:
+            d_image_batched = [d_image] * B
+        elif d_image.dim() == 2 and d_image.shape[0] == B:
+            d_image_batched = [d_image[b] for b in range(B)]
+        else:
+            # Fallback: use the first entry for all batches (common if B==1)
+            d_image_batched = [d_image[0]] * B
+
         position_ids = torch.zeros(3, B, T, dtype=torch.long, device=input_ids.device)
+
+        vision_ids = {image_pad_token}
+        if video_token_id is not None:
+            vision_ids.add(video_token_id)
+
         for batch_idx in range(B):
             seq = input_ids[batch_idx]
             d_img = d_image_batched[batch_idx]
-            # d_img = d_image[0]
+
             text_idx, image_idx, seq_idx = 0, 0, 0
-            print("d_img:", d_img)
             while seq_idx < T:
-                token_id = seq[seq_idx].item()
-                if token_id == image_pad_token:
-                    # start of an vision block (image(s))
+                token_id = int(seq[seq_idx].item())
+                is_vision = token_id in vision_ids
+
+                if is_vision:
+                    # Count contiguous run of vision tokens starting at seq_idx
+                    block_len = 0
+                    while (seq_idx + block_len) < T and int(seq[seq_idx + block_len].item()) in vision_ids:
+                        block_len += 1
+
                     text_idx, image_idx, seq_idx = Qwen3VL.emit_image_block(
                         position_ids=position_ids,
                         batch_idx=batch_idx,
@@ -159,11 +186,17 @@ class Qwen3VL(nn.Module):
                         text_idx=text_idx,
                         image_idx=image_idx,
                         d_image=d_img,
+                        block_len=block_len,
+                        spatial_merge_size=getattr(
+                            getattr(d_image, "spatial_merge_size", None), "spatial_merge_size", 2
+                        )
+                        if False
+                        else 2,
                     )
                 else:
-                    # treat as regular text token
+                    # Regular text token: repeat the same 1D index in all 3 channels
                     position_ids[:, batch_idx, seq_idx] = text_idx
-                    text_idx, image_idx, seq_idx = text_idx + 1, image_idx, seq_idx + 1
+                    text_idx, seq_idx = text_idx + 1, seq_idx + 1
 
         return position_ids
 
@@ -175,30 +208,38 @@ class Qwen3VL(nn.Module):
         text_idx: int,
         image_idx: int,
         d_image: torch.Tensor,
+        block_len: int,
         spatial_merge_size: int = 2,
     ) -> Tuple[int, int, int]:
-        t_img, h_img, w_img = d_image[image_idx]  # Extract image dimension info at current image_idx
-        # t_img, h_img, w_img = d_image
+        """
+        Fill position_ids for a contiguous run of vision tokens starting at seq_idx.
+
+        We *cap* writes by the actual run length (block_len) to avoid out-of-bounds
+        and to be robust if d_image implies a different number of tokens.
+        """
+        t_img, h_img, w_img = d_image
         t_img = int(t_img.item())
         h_img = int(h_img.item() // spatial_merge_size)
         w_img = int(w_img.item() // spatial_merge_size)
 
-        image_token_count = h_img * w_img
-        video_token_count = t_img * image_token_count
+        image_token_count = max(1, h_img * w_img)
 
-        for offset in range(video_token_count):  # Start from `offset` token id
-            target_idx = seq_idx + offset  # The absolute position in the sequence
-            frame_idx = offset // image_token_count  # The frame index
-            remaining = offset % image_token_count  # The position within the current frame
-            h_pos = remaining // w_img
-            w_pos = remaining % w_img
+        T_total = position_ids.shape[-1]
+        max_len = min(block_len, T_total - seq_idx)
 
-            # position_ids[:, batch_idx, target_idx] = text_idx
-            position_ids[0, batch_idx, target_idx] = text_idx + frame_idx  # temporal position
+        for offset in range(max_len):
+            target_idx = seq_idx + offset
+
+            frame_idx = offset // image_token_count
+            remaining = offset % image_token_count
+            h_pos = remaining // w_img if w_img > 0 else 0
+            w_pos = remaining % w_img if w_img > 0 else 0
+
+            position_ids[0, batch_idx, target_idx] = text_idx + frame_idx  # temporal
             position_ids[1, batch_idx, target_idx] = text_idx + h_pos
             position_ids[2, batch_idx, target_idx] = text_idx + w_pos
 
-        return text_idx + 1, image_idx + 1, seq_idx + video_token_count
+        return text_idx + 1, image_idx + 1, seq_idx + max_len
 
     @classmethod
     def from_pretrained(cls, weights_path: str, device_map: str = "auto") -> torch.nn.Module:
@@ -250,7 +291,6 @@ class Qwen3VL(nn.Module):
             no_split_module_classes=["Block", "VisionBlock"],
             dtype=torch.bfloat16,
         )
-
         return model
 
     @torch.no_grad()
@@ -263,25 +303,23 @@ class Qwen3VL(nn.Module):
         stop_tokens: Optional[list],
     ):
         if stop_tokens is None:
-            # <|im_end|>, <|im_start|>, <|endoftext|>
             stop_tokens = [151645, 151644, 151643]
 
         self.eval()
         generated_ids = input_ids
 
-        with torch.no_grad():
-            for _ in range(max_new_tokens):
-                logits = self.forward(input_ids=generated_ids, pixels=pixels, d_image=d_image)
-                last_logits = logits[:, -1, :]
-                probs = F.softmax(last_logits, dim=-1)
-                next_token = probs.argmax(dim=-1, keepdim=True)
-                generated_ids = torch.cat([generated_ids, next_token], dim=1)
+        for _ in range(max_new_tokens):
+            logits = self.forward(input_ids=generated_ids, pixels=pixels, d_image=d_image)
+            last_logits = logits[:, -1, :]
+            probs = F.softmax(last_logits, dim=-1)
+            next_token = probs.argmax(dim=-1, keepdim=True)
+            generated_ids = torch.cat([generated_ids, next_token], dim=1)
 
-                token_id = next_token[0].item()
-                yield token_id, generated_ids
+            token_id = next_token[0].item()
+            yield token_id, generated_ids
 
-                if token_id in stop_tokens:
-                    break
+            if token_id in stop_tokens:
+                break
 
     @torch.no_grad()
     def _generate_core_with_kv(
@@ -292,39 +330,31 @@ class Qwen3VL(nn.Module):
         max_new_tokens: int,
         stop_tokens: Optional[list],
     ):
-        """
-        Autoregressive generation using KV cache.
-
-        Strategy:
-          1) Reset KV cache and run the full prefix once (with vision if provided) to
-             build the cache and get logits for the last prefix token.
-          2) Then, for each new token, feed only that token (shape [B, 1]) into the
-             language model with the same KV cache and an appropriate 3D position_id.
-        """
         if stop_tokens is None:
-            # <|im_end|>, <|im_start|>, <|endoftext|>
             stop_tokens = [151645, 151644, 151643]
 
         self.eval()
         batch_size = input_ids.shape[0]
         assert batch_size == 1, "KV-cache generation currently supports batch_size = 1"
 
-        # 0) Reset KV cache for this sequence
         self.kv_cache.reset()
+        generated_ids = input_ids
 
-        generated_ids = input_ids  # [1, T0]
-
-        # 1) Build embeddings and 3D position_ids for the prefix
-        input_embeds = self.get_input_embeddings()(input_ids)  # [1, T0, C]
+        # Prefix
+        input_embeds = self.get_input_embeddings()(input_ids)
         position_ids = Qwen3VL.get_position_ids(
-            input_ids=input_ids, d_image=d_image, image_token_id=self.config.image_token_id
-        )  # [3, 1, T0]
+            input_ids=input_ids,
+            d_image=d_image,
+            image_token_id=self.config.image_token_id,
+            video_token_id=getattr(self.config, "video_token_id", None),
+        )
 
-        # 1a) Run the full prefix through the language model once (fills KV cache)
         if pixels is not None:
             pixels = pixels.to(input_embeds.dtype)
             vision_embed, deepstack_features = self.model.visual(pixels=pixels, d_image=d_image)
-            vision_mask = input_ids == self.config.image_token_id
+            vision_mask = (input_ids == self.config.image_token_id) | (
+                input_ids == getattr(self.config, "video_token_id", self.config.image_token_id)
+            )
             hidden = self.model.language_model(
                 input_embed=input_embeds,
                 vision_embed=vision_embed,
@@ -340,26 +370,20 @@ class Qwen3VL(nn.Module):
                 position_ids=position_ids,
             )
 
-        # hidden: [1, T0, C]
-        last_hidden = hidden[:, -1, :]  # [1, C]
+        last_hidden = hidden[:, -1, :]
+        last_logits = (
+            last_hidden @ self.model.language_model.embed_tokens.weight.T
+            if self.lm_head is None
+            else self.lm_head(last_hidden)
+        )
 
-        # 1b) Compute logits for the last prefix token
-        if self.lm_head is None:
-            last_logits = last_hidden @ self.model.language_model.embed_tokens.weight.T
-        else:
-            last_logits = self.lm_head(last_hidden)  # [1, V]
-
-        # Helper: greedy sampling (you can swap this to sampling later)
         def sample_next_token(logits: torch.Tensor) -> torch.Tensor:
             probs = F.softmax(logits, dim=-1)
-            return probs.argmax(dim=-1, keepdim=True)  # [1, 1]
+            return probs.argmax(dim=-1, keepdim=True)
 
-        # Decoding stage
-        # 2) Main decoding loop: one new token at a time
         for _ in range(max_new_tokens):
-            # 2a) Choose next token from previous step's logits
-            next_token = sample_next_token(last_logits)  # [1, 1]
-            generated_ids = torch.cat([generated_ids, next_token], dim=1)  # [1, T0 + step]
+            next_token = sample_next_token(last_logits)  # [1,1]
+            generated_ids = torch.cat([generated_ids, next_token], dim=1)
 
             token_id = next_token[0, 0].item()
             yield token_id, generated_ids
@@ -367,29 +391,27 @@ class Qwen3VL(nn.Module):
             if token_id in stop_tokens:
                 break
 
-            # ---- KEY CHANGE: recompute full position_ids and slice the last one ----
-            # This guarantees we use the exact same RoPE positions as the non-KV path.
             position_ids_full = Qwen3VL.get_position_ids(
-                input_ids=generated_ids, d_image=d_image, image_token_id=self.config.image_token_id
-            )  # [3, 1, T_total]
-            new_pos = position_ids_full[:, :, -1:]  # [3, 1, 1]
+                input_ids=generated_ids,
+                d_image=d_image,
+                image_token_id=self.config.image_token_id,
+                video_token_id=getattr(self.config, "video_token_id", None),
+            )
+            new_pos = position_ids_full[:, :, -1:]  # [3,1,1]
 
-            # 2b) Prepare embedding for the new token only
-            new_embed = self.get_input_embeddings()(next_token)  # [1, 1, C]
+            new_embed = self.get_input_embeddings()(next_token)
 
-            # 2c) Forward one step through the language model using cached KV
-            # No vision_embed / vision_mask here: incremental tokens are text-only.
             hidden_step = self.model.language_model(
                 input_embed=new_embed,
                 kv_cache=self.kv_cache,
                 position_ids=new_pos,
             )
-            last_hidden = hidden_step[:, -1, :]  # [1, C]
-
-            if self.lm_head is None:
-                last_logits = last_hidden @ self.model.language_model.embed_tokens.weight.T
-            else:
-                last_logits = self.lm_head(last_hidden)
+            last_hidden = hidden_step[:, -1, :]
+            last_logits = (
+                last_hidden @ self.model.language_model.embed_tokens.weight.T
+                if self.lm_head is None
+                else self.lm_head(last_hidden)
+            )
 
     def generate(
         self,
@@ -400,15 +422,6 @@ class Qwen3VL(nn.Module):
         stop_tokens: Optional[list] = None,
     ):
         generated_ids = input_ids
-
-        # for _, generated_ids in self._generate_core(
-        #     input_ids=input_ids,
-        #     pixels=pixels,
-        #     d_image=d_image,
-        #     max_new_tokens=max_new_tokens,
-        #     stop_tokens=stop_tokens,
-        # ):
-        #     pass
         for _, generated_ids in self._generate_core_with_kv(
             input_ids=input_ids,
             pixels=pixels,
@@ -417,7 +430,6 @@ class Qwen3VL(nn.Module):
             stop_tokens=stop_tokens,
         ):
             pass
-
         return generated_ids
 
     def generate_stream(
@@ -428,7 +440,7 @@ class Qwen3VL(nn.Module):
         max_new_tokens: int = 1,
         stop_tokens: Optional[list] = None,
     ):
-        for token_id, generated_ids in self._generate_core_with_kv(
+        for token_id, _ in self._generate_core_with_kv(
             input_ids=input_ids,
             pixels=pixels,
             d_image=d_image,
