@@ -14,8 +14,11 @@ uv pip install -e .
 
 Here is the example:
 
-<video src='https://github.com/YYZhang2025/Qwen3-VL/blob/main/assets/demo-cli.mp4' controls='controls' style='max-width: 100%; height: auto;' ></video>
 
+
+
+
+https://github.com/user-attachments/assets/2e5ff59f-2a96-4b5d-9e99-12d63ef0f034
 
 
 
