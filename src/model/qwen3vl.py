@@ -78,27 +78,70 @@ class Qwen3VL(nn.Module):
         # Optional convenience; keep for API symmetry
         return getattr(self.model, "visual", None)
 
+    # def forward(
+    #     self,
+    #     input_ids: torch.Tensor,
+    #     pixels: Optional[torch.Tensor] = None,  # Images / video frames
+    #     d_image: Optional[torch.Tensor] = None,  # (t, h, w) or batched
+    #     kv_cache: Optional["KVCache"] = None,
+    # ) -> torch.Tensor:
+    #     input_embeds = self.get_input_embeddings()(input_ids)
+
+    #     position_ids = Qwen3VL.get_position_ids(
+    #         input_ids=input_ids,
+    #         d_image=d_image,
+    #         image_token_id=self.config.image_token_id,
+    #         video_token_id=getattr(self.config, "video_token_id", None),
+    #     )
+
+    #     if pixels is not None:
+    #         pixels = pixels.to(input_embeds.dtype)
+    #         vision_embed, deepstack_features = self.model.visual(pixels=pixels, d_image=d_image)
+    #         vision_mask = (input_ids == self.config.image_token_id) | (
+    #             input_ids == getattr(self.config, "video_token_id", self.config.image_token_id)
+    #         )
+    #         output = self.model.language_model(
+    #             input_embed=input_embeds,
+    #             vision_embed=vision_embed,
+    #             deepstack_features=deepstack_features,
+    #             kv_cache=kv_cache,
+    #             vision_mask=vision_mask,
+    #             position_ids=position_ids,
+    #         )
+    #     else:
+    #         output = self.model.language_model(
+    #             input_embed=input_embeds,
+    #             kv_cache=kv_cache,
+    #             position_ids=position_ids,
+    #         )
+
+    #     logits = (
+    #         output @ self.model.language_model.embed_tokens.weight.T
+    #         if self.lm_head is None
+    #         else self.lm_head(output)
+    #     )
+    #     return logits
     def forward(
         self,
         input_ids: torch.Tensor,
-        pixels: Optional[torch.Tensor] = None,  # Images / video frames
-        d_image: Optional[torch.Tensor] = None,  # (t, h, w) or batched
+        pixels: Optional[torch.Tensor] = None,
+        d_image: Optional[torch.Tensor] = None,
         kv_cache: Optional["KVCache"] = None,
+        vision_embed: Optional[torch.Tensor] = None,
+        deepstack_features=None,
     ) -> torch.Tensor:
         input_embeds = self.get_input_embeddings()(input_ids)
-
         position_ids = Qwen3VL.get_position_ids(
-            input_ids=input_ids,
-            d_image=d_image,
-            image_token_id=self.config.image_token_id,
-            video_token_id=getattr(self.config, "video_token_id", None),
+            input_ids=input_ids, d_image=d_image, image_token_id=self.config.image_token_id
         )
 
-        if pixels is not None:
+        if vision_embed is None and pixels is not None:
             pixels = pixels.to(input_embeds.dtype)
             vision_embed, deepstack_features = self.model.visual(pixels=pixels, d_image=d_image)
+
+        if vision_embed is not None:
             vision_mask = (input_ids == self.config.image_token_id) | (
-                input_ids == getattr(self.config, "video_token_id", self.config.image_token_id)
+                input_ids == self.config.video_token_id
             )
             output = self.model.language_model(
                 input_embed=input_embeds,
@@ -352,6 +395,9 @@ class Qwen3VL(nn.Module):
         if pixels is not None:
             pixels = pixels.to(input_embeds.dtype)
             vision_embed, deepstack_features = self.model.visual(pixels=pixels, d_image=d_image)
+            # vision_embed, deepstack_features = self.forward(
+            #     input_ids=input_ids, pixels=pixels, d_image=d_image
+            # )
             vision_mask = (input_ids == self.config.image_token_id) | (
                 input_ids == getattr(self.config, "video_token_id", self.config.image_token_id)
             )

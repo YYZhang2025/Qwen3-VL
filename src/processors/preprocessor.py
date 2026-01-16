@@ -1,4 +1,9 @@
-from typing import List, Optional
+# src/processors/preprocessor.py
+from __future__ import annotations
+
+import hashlib
+import os
+from typing import Any, Dict, List, Optional
 
 import imageio.v3 as iio
 import numpy as np
@@ -25,27 +30,25 @@ from src.processors.video_processor import VideoPreprocessor, build_time_encoded
 from src.utils.vision_utils import fetch_image
 
 
-def load_video_frames(
-    video_path: str,
-    *,
-    indices: Optional[np.ndarray] = None,
-) -> List[Image.Image]:
-    """
-    Load video frames from a local file into a list of PIL Images (RGB).
+def _stat_sig(path: str) -> str:
+    st = os.stat(path)
+    return f"{path}|{st.st_size}|{int(st.st_mtime)}"
 
-    - If `indices` is provided: load only those frames.
-    - Else: load all frames (can be large).
-    """
+
+def _sha1(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()
+
+
+def load_video_frames(video_path: str, *, indices: Optional[np.ndarray] = None) -> List[Image.Image]:
     if indices is None:
-        # loads all frames: (T, H, W, C)
-        arr = iio.imread(video_path)  # may be heavy for long videos
-        if arr.ndim == 3:  # grayscale video (T, H, W)
+        arr = iio.imread(video_path)  # (T,H,W,C) or (T,H,W)
+        if arr.ndim == 3:
             arr = np.stack([arr, arr, arr], axis=-1)
         return [Image.fromarray(frame.astype(np.uint8)).convert("RGB") for frame in arr]
 
     frames: List[Image.Image] = []
     for i in indices.tolist():
-        frame = iio.imread(video_path, index=int(i))  # single frame (H, W, C) or (H, W)
+        frame = iio.imread(video_path, index=int(i))
         if frame.ndim == 2:
             frame = np.stack([frame, frame, frame], axis=-1)
         frames.append(Image.fromarray(frame.astype(np.uint8)).convert("RGB"))
@@ -62,32 +65,9 @@ def sample_frames(
     min_frames: int = 4,
     max_frames: int = 768,
 ) -> np.ndarray:
-    """
-    Uniformly sample frame indices from a video.
-
-    Behavior (matches Qwen3-VL logic):
-
-    - If `num_frames` is provided: sample exactly that many frames.
-    - Else if `fps` is provided: sample `fps` frames per second using `video_fps`.
-      - If `video_fps` is None, defaults to 24 FPS.
-    - Else: sample `total_num_frames` clamped to [min_frames, max_frames].
-
-    Args:
-        total_num_frames: Total number of frames in the video.
-        num_frames: Explicit number of frames to sample.
-        fps: Target frames per second.
-        video_fps: Original video FPS (required when using `fps`).
-        default_fps: FPS used when neither `fps` nor `num_frames` is provided.
-        min_frames: Minimum number of sampled frames.
-        max_frames: Maximum number of sampled frames.
-
-    Returns:
-        indices: np.ndarray of shape (num_frames,), dtype int64
-    """
     if fps is not None and num_frames is not None:
-        raise ValueError("`num_frames` and `fps` are mutually exclusive, use only one.")
+        raise ValueError("`num_frames` and `fps` are mutually exclusive.")
 
-    # Default behavior follows Qwen3-VL
     fps = fps if fps is not None else default_fps
 
     if num_frames is None and fps is not None:
@@ -132,104 +112,115 @@ class Processor:
     @classmethod
     def from_pretrained(cls, repo_id: str):
         tokenizer = Tokenizer.from_pretrained(repo_id)
-
-        min_pixels = 65536
-        max_pixels = 16777216
-
-        return cls(tokenizer, min_pixels=min_pixels, max_pixels=max_pixels)
+        return cls(tokenizer, min_pixels=65536, max_pixels=16777216)
 
     def _render_tool_call(self, tool_call: dict) -> str:
         return TOOL_CALL_TEMPLATE.format(name=tool_call["name"], arguments=tool_call["arguments"])
 
-    def _render_content(self, content: dict, pixels_list: List, d_image_list: List) -> str:
+    def _render_content(
+        self,
+        content: dict,
+        pixels_list: List[np.ndarray],
+        d_image_list: List[List[int]],
+        media_keys: List[str],
+        media_cache: Optional[Dict[str, Any]],
+        training: bool = False,
+    ) -> str:
         if content["type"] == "text":
             return content["text"]
-        elif content["type"] == "image":
-            image = None
-            if "image" in content:
-                image_field = content["image"]
-                if isinstance(image_field, Image.Image):
-                    image = image_field
-                else:
-                    image = Image.open(image_field)
-            elif "url" in content:
-                image = fetch_image(content["url"])
-            else:
-                raise ValueError("Image content must have either 'image' or 'url' field.")
 
-            patches, grid_t, grid_h, grid_w = self.image_preprocessor(image)
+        if content["type"] == "image":
+            # key
+            if "image" in content and isinstance(content["image"], str):
+                key = _sha1("img|" + _stat_sig(content["image"]))
+            elif "url" in content:
+                key = _sha1("img|url|" + content["url"])
+            else:
+                key = _sha1("img|pil")
+            media_keys.append(key)
+
+            if media_cache is not None and key in media_cache:
+                patches, grid_t, grid_h, grid_w = media_cache[key]
+            else:
+                if "image" in content:
+                    image_field = content["image"]
+                    image = image_field if isinstance(image_field, Image.Image) else Image.open(image_field)
+                elif "url" in content:
+                    image = fetch_image(content["url"])
+                else:
+                    raise ValueError("Image content must have either 'image' or 'url' field.")
+
+                patches, grid_t, grid_h, grid_w = self.image_preprocessor(image)
+                if media_cache is not None:
+                    media_cache[key] = (patches, int(grid_t), int(grid_h), int(grid_w))
 
             pixels_list.append(patches)
-            d_image_list.append([grid_t, grid_h, grid_w])
+            d_image_list.append([int(grid_t), int(grid_h), int(grid_w)])
 
-            pad_count = (grid_t * grid_h * grid_w) // (
+            pad_count = (int(grid_t) * int(grid_h) * int(grid_w)) // (
                 self.image_preprocessor.spatial_merge_size * self.image_preprocessor.spatial_merge_size
             )
             pad_tokens = IMAGE_PAD_TOKEN * pad_count
-
             return VISION_TEMPLATE.format(content=pad_tokens)
-        elif content["type"] == "video":
-            # ---- 1) Get frames
-            # Support:
-            #   - content["frames"]: list[PIL.Image.Image]
-            #   - content["video"]: local path
-            # (If you want URL support, download to a temp file then pass that path here.)
-            if "frames" in content:
-                frames = content["frames"]
-                if not (isinstance(frames, list) and all(isinstance(f, Image.Image) for f in frames)):
-                    raise ValueError("content['frames'] must be a list of PIL.Image.Image")
-            elif "video" in content:
-                video_path = content["video"]
 
-                # Optional: use the standalone sampler to avoid loading full video
-                # If you already know total_num_frames from metadata, pass it here.
-                # Otherwise you can load all frames (may be heavy).
-                if "total_num_frames" in content:
+        if content["type"] == "video":
+            video_path = content["video"]
+            fps = float(content.get("fps", self.video_preprocessor.fps))
+            total_num_frames = content.get("total_num_frames", None)
+            video_fps = content.get("video_fps", None)
+
+            key = _sha1("vid|" + _stat_sig(video_path) + f"|fps={fps}|tnf={total_num_frames}|vf={video_fps}")
+            media_keys.append(key)
+
+            if media_cache is not None and key in media_cache:
+                patches, grid_t, grid_h, grid_w = media_cache[key]
+            else:
+                if total_num_frames is not None:
                     idx = sample_frames(
-                        total_num_frames=int(content["total_num_frames"]),
-                        fps=content.get("fps", self.video_preprocessor.fps),
+                        total_num_frames=int(total_num_frames),
+                        fps=fps,
                         min_frames=self.video_preprocessor.min_frames,
                         max_frames=self.video_preprocessor.max_frames,
-                        video_fps=content.get("video_fps", None),
+                        video_fps=video_fps,
                     )
                     frames = load_video_frames(video_path, indices=idx)
                 else:
                     frames = load_video_frames(video_path, indices=None)
-            else:
-                raise ValueError("Video content must have either 'frames' or 'video' field.")
 
-            # ---- 2) Preprocess video -> patches + grid
-            patches, grid_t, grid_h, grid_w = self.video_preprocessor(frames)
+                patches, grid_t, grid_h, grid_w = self.video_preprocessor(frames)
+                if media_cache is not None:
+                    media_cache[key] = (patches, int(grid_t), int(grid_h), int(grid_w))
 
             pixels_list.append(patches)
-            d_image_list.append([grid_t, grid_h, grid_w])
+            d_image_list.append([int(grid_t), int(grid_h), int(grid_w)])
 
-            seconds_per_temporal_patch = (
-                self.video_preprocessor.temporal_patch_size / self.video_preprocessor.fps
-            )
-
-            # ---- 3) Emit pad tokens (same merge logic as image)
+            seconds_per_temporal_patch = self.video_preprocessor.temporal_patch_size / fps
             placeholder = build_time_encoded_video_placeholder(
-                grid_t=grid_t,
-                grid_h=grid_h,
-                grid_w=grid_w,
+                grid_t=int(grid_t),
+                grid_h=int(grid_h),
+                grid_w=int(grid_w),
                 spatial_merge_size=self.video_preprocessor.spatial_merge_size,
-                image_pad_token=IMAGE_PAD_TOKEN,  # Qwen3-VL uses image pad token for video too
+                image_pad_token=IMAGE_PAD_TOKEN,
                 seconds_per_temporal_patch=seconds_per_temporal_patch,
-                time_format="mixed",  # seconds + HMS during training
-                training=False,  # set this flag in your class
+                time_format="mixed",
+                training=training,
             )
-
             return VISION_TEMPLATE.format(content=placeholder)
 
-        else:
-            raise ValueError(f"Unsupported content type: {content['type']}")
+        raise ValueError(f"Unsupported content type: {content['type']}")
 
     def __call__(
-        self, messages: List[dict], add_generation_prompt: bool = True, device: Optional[torch.device] = None
-    ):
-        pixels_list = []
-        d_image_list = []
+        self,
+        messages: List[dict],
+        add_generation_prompt: bool = True,
+        device: Optional[torch.device] = None,
+        *,
+        media_cache: Optional[Dict[str, Any]] = None,
+        return_media_keys: bool = False,
+    ) -> Dict[str, Any]:
+        pixels_list: List[np.ndarray] = []
+        d_image_list: List[List[int]] = []
+        media_keys: List[str] = []
         messages_str = ""
 
         for message in messages:
@@ -237,10 +228,15 @@ class Processor:
             content = message.get("content", [])
 
             tool_calls = message.get("tool_calls", [])
-            tool_calls = [self._render_tool_call(tool_call) for tool_call in tool_calls]
+            tool_calls = [self._render_tool_call(tc) for tc in tool_calls]
             tool_call_str = "".join(tool_calls)
 
-            content_str = "".join([self._render_content(item, pixels_list, d_image_list) for item in content])
+            content_str = "".join(
+                [
+                    self._render_content(item, pixels_list, d_image_list, media_keys, media_cache)
+                    for item in content
+                ]
+            )
 
             if role == "system":
                 messages_str += SYSTEM_MESSAGE_TEMPLATE.format(content=content_str)
@@ -258,8 +254,8 @@ class Processor:
         if add_generation_prompt:
             messages_str += "<|im_start|>assistant\n"
 
-        input_ids = self.tokenizer.encode(messages_str).ids
-        input_ids = torch.tensor([input_ids], dtype=torch.long)
+        input_ids = torch.tensor([self.tokenizer.encode(messages_str).ids], dtype=torch.long)
+
         if pixels_list:
             pixels_np = np.concatenate(pixels_list, axis=0)
             pixels = torch.tensor(pixels_np, dtype=torch.float)
@@ -268,18 +264,15 @@ class Processor:
             pixels = None
             d_image = None
 
-        output = {
-            "input_ids": input_ids,
-            "pixels": pixels,
-            "d_image": d_image,
-        }
+        out: Dict[str, Any] = {"input_ids": input_ids, "pixels": pixels, "d_image": d_image}
+        if return_media_keys:
+            out["media_keys"] = media_keys
 
         if device is not None:
-            output["input_ids"] = output["input_ids"].to(device)
-            if output["pixels"] is not None:
-                output["pixels"] = output["pixels"].to(device)
-            if output["d_image"] is not None:
-                output["d_image"] = output["d_image"].to(device)
+            out["input_ids"] = out["input_ids"].to(device)
+            if out["pixels"] is not None:
+                out["pixels"] = out["pixels"].to(device)
+            if out["d_image"] is not None:
+                out["d_image"] = out["d_image"].to(device)
 
-                print("output['d_image']:", output["d_image"])
-        return output
+        return out
